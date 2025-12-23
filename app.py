@@ -8,26 +8,26 @@ from flask_sqlalchemy import SQLAlchemy
 import cloudinary
 import cloudinary.uploader
 
-# ================= APP SETUP =================
 app = Flask(__name__)
 
-CORS(app, supports_credentials=True, resources={r"/*": {"origins": "*"}})
+# Enhanced CORS for JWT headers
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
-app.config["JWT_SECRET_KEY"] = os.getenv("ADMIN_JWT_SECRET", "dev-secret")
+app.config["JWT_SECRET_KEY"] = os.getenv("ADMIN_JWT_SECRET", "dev-secret-123")
 
-# 🔥 FIX postgres:// issue on Render
-db_url = os.getenv("DATABASE_URL")
-if db_url and db_url.startswith("postgres://"):
+# DB Setup
+db_url = os.getenv("DATABASE_URL", "sqlite:///test.db") # Fallback to local sqlite
+if db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql://", 1)
 
 app.config["SQLALCHEMY_DATABASE_URI"] = db_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024 * 1024  # 1GB
+app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # Reduced to 100MB for stability
 
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
 
-# ================= CLOUDINARY =================
+# Cloudinary config
 cloudinary.config(
     cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
     api_key=os.getenv("CLOUDINARY_API_KEY"),
@@ -35,12 +35,11 @@ cloudinary.config(
     secure=True
 )
 
-# ================= MODELS =================
+# Models
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80))
     email = db.Column(db.String(120))
-
 
 class Video(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -50,126 +49,68 @@ class Video(db.Model):
     video_url = db.Column(db.Text)
     thumbnail_url = db.Column(db.Text)
 
-
 with app.app_context():
     db.create_all()
 
-# ================= ADMIN CREDS =================
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
+# Admin Login (Make sure these Env Vars are set on Render!)
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "password123")
 
-# ================= JWT ERROR HANDLING =================
-@jwt.unauthorized_loader
-def unauthorized(err):
-    return jsonify({"message": "Missing or invalid token"}), 401
-
-# ================= LOGIN =================
 @app.route("/admin/login", methods=["POST"])
 def admin_login():
-    data = request.json or {}
-
+    data = request.get_json()
+    if not data:
+        return jsonify({"message": "Missing JSON in request"}), 400
+    
     if data.get("username") == ADMIN_USERNAME and data.get("password") == ADMIN_PASSWORD:
+        # identity must be a string
         token = create_access_token(identity="admin")
         return jsonify({"success": True, "token": token})
 
     return jsonify({"success": False, "message": "Invalid credentials"}), 401
 
-# ================= USERS =================
 @app.route("/admin/users", methods=["GET"])
 @jwt_required()
 def admin_users():
-    if get_jwt_identity() != "admin":
-        return jsonify({"message": "Forbidden"}), 403
-
     users = User.query.all()
-    return jsonify([
-        {"id": u.id, "username": u.username, "email": u.email}
-        for u in users
-    ])
+    return jsonify([{"id": u.id, "username": u.username, "email": u.email} for u in users])
 
-# ================= VIDEOS =================
 @app.route("/admin/videos", methods=["GET"])
 @jwt_required()
 def admin_videos():
-    if get_jwt_identity() != "admin":
-        return jsonify({"message": "Forbidden"}), 403
-
     videos = Video.query.all()
-    return jsonify([
-        {
-            "id": v.id,
-            "title": v.title,
-            "category": v.category,
-            "section": v.section,
-            "video_url": v.video_url,
-            "thumbnail": v.thumbnail_url
-        } for v in videos
-    ])
+    return jsonify([{
+        "id": v.id, "title": v.title, "category": v.category,
+        "section": v.section, "video_url": v.video_url, "thumbnail": v.thumbnail_url
+    } for v in videos])
 
-# ================= ADD VIDEO =================
 @app.route("/admin/videos", methods=["POST"])
 @jwt_required()
 def add_video():
-    if get_jwt_identity() != "admin":
-        return jsonify({"message": "Forbidden"}), 403
-
-    title = request.form.get("title")
-    category = request.form.get("category")
-    section = request.form.get("section") or "Latest"
-    video = request.files.get("video")
-    thumbnail = request.files.get("thumbnail")
-
-    if not title or not category or not video or not thumbnail:
-        return jsonify({"success": False, "message": "Missing required fields"}), 400
-
     try:
-        video_res = cloudinary.uploader.upload(
-            video,
-            resource_type="video",
-            folder="watsee/videos"
-        )
+        title = request.form.get("title")
+        category = request.form.get("category")
+        section = request.form.get("section", "Latest")
+        video_file = request.files.get("video")
+        thumb_file = request.files.get("thumbnail")
 
-        thumb_res = cloudinary.uploader.upload(
-            thumbnail,
-            folder="watsee/thumbnails"
-        )
+        if not all([title, category, video_file, thumb_file]):
+            return jsonify({"message": "Missing fields"}), 400
 
-        v = Video(
-            title=title,
-            category=category,
-            section=section,
-            video_url=video_res["secure_url"],
-            thumbnail_url=thumb_res["secure_url"]
-        )
+        # Upload to Cloudinary
+        v_res = cloudinary.uploader.upload(video_file, resource_type="video", folder="watsee/videos")
+        t_res = cloudinary.uploader.upload(thumb_file, folder="watsee/thumbnails")
 
-        db.session.add(v)
+        new_video = Video(
+            title=title, category=category, section=section,
+            video_url=v_res["secure_url"], thumbnail_url=t_res["secure_url"]
+        )
+        db.session.add(new_video)
         db.session.commit()
 
-        return jsonify({"success": True, "message": "Video uploaded successfully"})
-
+        return jsonify({"success": True, "message": "Uploaded successfully!"})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
 
-# ================= UPDATE VIDEO =================
-@app.route("/admin/videos/<int:video_id>", methods=["PUT"])
-@jwt_required()
-def update_video(video_id):
-    if get_jwt_identity() != "admin":
-        return jsonify({"message": "Forbidden"}), 403
-
-    data = request.json or {}
-    video = Video.query.get(video_id)
-
-    if not video:
-        return jsonify({"message": "Not found"}), 404
-
-    video.title = data.get("title", video.title)
-    video.category = data.get("category", video.category)
-    video.section = data.get("section", video.section)
-
-    db.session.commit()
-    return jsonify({"success": True, "message": "Updated successfully"})
-
-# ================= RUN =================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
