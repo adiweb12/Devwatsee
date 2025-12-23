@@ -1,45 +1,46 @@
-import os
+import os, random, string, smtplib
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from flask_jwt_extended import (
-    JWTManager, create_access_token, jwt_required, get_jwt_identity
-)
 from flask_sqlalchemy import SQLAlchemy
-import cloudinary
-import cloudinary.uploader
+from flask_jwt_extended import (
+    JWTManager, create_access_token,
+    jwt_required, get_jwt_identity
+)
+from werkzeug.security import generate_password_hash, check_password_hash
+from email.message import EmailMessage
+from datetime import timedelta
 
+# ================= APP SETUP =================
 app = Flask(__name__)
 
-# Enhanced CORS for JWT headers
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+# ✅ FIXED CORS (MOST IMPORTANT)
+CORS(
+    app,
+    supports_credentials=True,
+    resources={r"/*": {"origins": "*"}},
+    allow_headers=["Authorization", "Content-Type"]
+)
 
-app.config["JWT_SECRET_KEY"] = os.getenv("ADMIN_JWT_SECRET", "dev-secret-123")
-
-# DB Setup
-db_url = os.getenv("DATABASE_URL", "sqlite:///test.db") # Fallback to local sqlite
-if db_url.startswith("postgres://"):
-    db_url = db_url.replace("postgres://", "postgresql://", 1)
-
-app.config["SQLALCHEMY_DATABASE_URI"] = db_url
+app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL")
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # Reduced to 100MB for stability
+app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY")  # SAME SECRET ✔
+app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=2)
 
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
 
-# Cloudinary config
-cloudinary.config(
-    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
-    api_key=os.getenv("CLOUDINARY_API_KEY"),
-    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
-    secure=True
-)
+# ================= EMAIL CONFIG =================
+EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 
-# Models
+# ================= DATABASE MODELS =================
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(80))
-    email = db.Column(db.String(120))
+    username = db.Column(db.String(80), unique=True)
+    name = db.Column(db.String(120))
+    email = db.Column(db.String(120), unique=True)
+    password = db.Column(db.String(200))
+
 
 class Video(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -49,68 +50,185 @@ class Video(db.Model):
     video_url = db.Column(db.Text)
     thumbnail_url = db.Column(db.Text)
 
+
+class SavedVideo(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer)
+    video_id = db.Column(db.Integer)
+
+
 with app.app_context():
     db.create_all()
 
-# Admin Login (Make sure these Env Vars are set on Render!)
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "password123")
+# ================= EMAIL =================
+def send_email(to, new_password):
+    msg = EmailMessage()
+    msg["Subject"] = "WATSEE - Password Reset"
+    msg["From"] = EMAIL_ADDRESS
+    msg["To"] = to
+    msg.set_content(
+        f"Your new password:\n\n{new_password}\n\nPlease change it after login."
+    )
 
-@app.route("/admin/login", methods=["POST"])
-def admin_login():
-    data = request.get_json()
-    if not data:
-        return jsonify({"message": "Missing JSON in request"}), 400
-    
-    if data.get("username") == ADMIN_USERNAME and data.get("password") == ADMIN_PASSWORD:
-        # identity must be a string
-        token = create_access_token(identity="admin")
-        return jsonify({"success": True, "token": token})
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+        smtp.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+        smtp.send_message(msg)
 
-    return jsonify({"success": False, "message": "Invalid credentials"}), 401
+# ================= AUTH =================
+@app.route("/signup", methods=["POST"])
+def signup():
+    data = request.json
 
-@app.route("/admin/users", methods=["GET"])
+    if User.query.filter(
+        (User.username == data["username"]) |
+        (User.email == data["email"])
+    ).first():
+        return {"success": False, "msg": "User exists"}, 409
+
+    user = User(
+        username=data["username"],
+        name=data.get("name"),
+        email=data["email"],
+        password=generate_password_hash(data["password"])
+    )
+
+    db.session.add(user)
+    db.session.commit()
+    return {"success": True}
+
+
+@app.route("/login", methods=["POST"])
+def login():
+    data = request.json
+    user = User.query.filter_by(username=data["username"]).first()
+
+    if not user or not check_password_hash(user.password, data["password"]):
+        return {"success": False}, 401
+
+    token = create_access_token(identity=user.id)
+    return {"success": True, "access_token": token}
+
+# ================= FORGOT PASSWORD =================
+@app.route("/forgot-password", methods=["POST"])
+def forgot_password():
+    email = request.json.get("email")
+    user = User.query.filter_by(email=email).first()
+
+    if not user:
+        return {"success": False}, 404
+
+    new_pass = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
+    user.password = generate_password_hash(new_pass)
+    db.session.commit()
+
+    send_email(email, new_pass)
+    return {"success": True}
+
+# ================= PROFILE =================
+@app.route("/profile", methods=["GET"])
 @jwt_required()
-def admin_users():
-    users = User.query.all()
-    return jsonify([{"id": u.id, "username": u.username, "email": u.email} for u in users])
+def profile():
+    user = User.query.get(get_jwt_identity())
+    return {
+        "username": user.username,
+        "name": user.name,
+        "email": user.email
+    }
 
-@app.route("/admin/videos", methods=["GET"])
+
+@app.route("/profile/update", methods=["POST"])
 @jwt_required()
-def admin_videos():
-    videos = Video.query.all()
-    return jsonify([{
-        "id": v.id, "title": v.title, "category": v.category,
-        "section": v.section, "video_url": v.video_url, "thumbnail": v.thumbnail_url
-    } for v in videos])
+def update_profile():
+    user = User.query.get(get_jwt_identity())
+    data = request.json
 
-@app.route("/admin/videos", methods=["POST"])
+    user.name = data.get("name")
+    user.email = data.get("email")
+    db.session.commit()
+    return {"success": True}
+
+# ================= VIDEOS (FIXED) =================
+@app.route("/videos", methods=["GET"])
 @jwt_required()
-def add_video():
-    try:
-        title = request.form.get("title")
-        category = request.form.get("category")
-        section = request.form.get("section", "Latest")
-        video_file = request.files.get("video")
-        thumb_file = request.files.get("thumbnail")
+def videos():
+    vids = Video.query.all()
+    return jsonify([
+        {
+            "id": v.id,
+            "title": v.title,
+            "category": v.category,
+            "section": v.section,
+            "video_url": v.video_url,
+            "thumbnail": v.thumbnail_url
+        } for v in vids
+    ])
 
-        if not all([title, category, video_file, thumb_file]):
-            return jsonify({"message": "Missing fields"}), 400
+# ================= SAVE / UNSAVE =================
+@app.route("/save", methods=["POST"])
+@jwt_required()
+def save_video():
+    user_id = get_jwt_identity()
+    video_id = request.json.get("video_id")
 
-        # Upload to Cloudinary
-        v_res = cloudinary.uploader.upload(video_file, resource_type="video", folder="watsee/videos")
-        t_res = cloudinary.uploader.upload(thumb_file, folder="watsee/thumbnails")
+    if SavedVideo.query.filter_by(
+        user_id=user_id, video_id=video_id
+    ).first():
+        return {"saved": True}
 
-        new_video = Video(
-            title=title, category=category, section=section,
-            video_url=v_res["secure_url"], thumbnail_url=t_res["secure_url"]
-        )
-        db.session.add(new_video)
-        db.session.commit()
+    db.session.add(SavedVideo(user_id=user_id, video_id=video_id))
+    db.session.commit()
+    return {"saved": True}
 
-        return jsonify({"success": True, "message": "Uploaded successfully!"})
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
 
+@app.route("/unsave", methods=["POST"])
+@jwt_required()
+def unsave_video():
+    user_id = get_jwt_identity()
+    video_id = request.json.get("video_id")
+
+    SavedVideo.query.filter_by(
+        user_id=user_id, video_id=video_id
+    ).delete()
+    db.session.commit()
+    return {"saved": False}
+
+# ================= SAVED LIST =================
+@app.route("/saved", methods=["GET"])
+@jwt_required()
+def saved():
+    user_id = get_jwt_identity()
+
+    rows = db.session.query(Video).join(
+        SavedVideo, Video.id == SavedVideo.video_id
+    ).filter(SavedVideo.user_id == user_id).all()
+
+    return jsonify([
+        {
+            "id": v.id,
+            "title": v.title,
+            "thumbnail": v.thumbnail_url
+        } for v in rows
+    ])
+
+# ================= CHANGE PASSWORD =================
+@app.route("/change-password", methods=["POST"])
+@jwt_required()
+def change_password():
+    user = User.query.get(get_jwt_identity())
+    data = request.json
+
+    if not check_password_hash(user.password, data["oldPassword"]):
+        return {"success": False}, 401
+
+    user.password = generate_password_hash(data["newPassword"])
+    db.session.commit()
+    return {"success": True}
+
+# ================= JWT ERROR HANDLER =================
+@jwt.unauthorized_loader
+def unauthorized(reason):
+    return jsonify({"error": "Missing or invalid token"}), 401
+
+# ================= RUN =================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run()
