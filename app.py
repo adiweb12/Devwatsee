@@ -25,7 +25,7 @@ app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL")
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 # 🔥 IMPORTANT
-app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", "adithwatseetyty")
+app.config["JWT_SECRET_KEY"] = "adithwatseetyty"
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=2)
 app.config["JWT_TOKEN_LOCATION"] = ["headers"]
 app.config["JWT_HEADER_NAME"] = "Authorization"
